@@ -488,6 +488,24 @@ func (f *Fs) About(ctx context.Context) (_ *fs.Usage, err error) {
 	return usage, nil
 }
 
+type smbWriterAt struct {
+	pool *filePool
+}
+
+func (w *smbWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	f, err := w.pool.get()
+	if err != nil {
+		return 0, err
+	}
+	defer w.pool.put(f, err)
+
+	return f.WriteAt(p, off)
+}
+
+func (w *smbWriterAt) Close() error {
+	return w.pool.drain()
+}
+
 // OpenWriterAt opens with a handle for random access writes
 //
 // Pass in the remote desired and the size if known.
@@ -509,22 +527,27 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.Wr
 		return nil, fmt.Errorf("failed to make parent directories: %w", err)
 	}
 
-	filename = o.fs.toSambaPath(filename)
+	smbPath := o.fs.toSambaPath(filename)
 
-	o.fs.addSession() // Show session in use
-	defer o.fs.removeSession()
-
+	// One-time truncate
 	cn, err := o.fs.getConnection(ctx, share)
 	if err != nil {
 		return nil, err
 	}
-
-	fl, err := cn.smbShare.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	file, err := cn.smbShare.OpenFile(smbPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open: %w", err)
+		f.putConnection(&cn, err)
+		return nil, err
 	}
+	if size > 0 {
+		_ = file.Truncate(size)
+	}
+	_ = file.Close()
+	f.putConnection(&cn, nil)
 
-	return fl, nil
+	return &smbWriterAt{
+		pool: newFilePool(ctx, f, share, smbPath),
+	}, nil
 }
 
 // Shutdown the backend, closing any background tasks and any
